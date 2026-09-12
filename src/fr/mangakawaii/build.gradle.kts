@@ -6,12 +6,12 @@ plugins {
 
 keiyoushi {
     name = "Mangakawaii"
-    versionCode = 39
+    versionCode = 40
     contentWarning = ContentWarning.SAFE
     libVersion = "1.4"
 
     source {
         lang = "fr"
-        baseUrl = "https://www.mangakawaii.io"
+        baseUrl = "https://www.mangakawaii.fr"
     }
 }
