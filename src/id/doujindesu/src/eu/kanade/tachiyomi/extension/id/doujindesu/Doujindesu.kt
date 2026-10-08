@@ -25,7 +25,6 @@ import java.util.LinkedHashMap
 abstract class Doujindesu : KeiSource() {
 
     private val apiUrl get() = "$baseUrl/api"
-
     private val decryptor = Decryptor { apiUrl }
 
     private val slugCache = object : LinkedHashMap<String, String>() {
@@ -45,12 +44,9 @@ abstract class Doujindesu : KeiSource() {
         }
     }
 
-    override fun Headers.Builder.configureHeaders() = apply {
-        add("x-app-secret", APP_SECRET)
-    }
+    override fun Headers.Builder.configureHeaders() = apply { add("x-app-secret", APP_SECRET) }
 
     override suspend fun getPopularManga(page: Int): MangasPage = fetchMangaList(mangaListUrl(page, "rating"), page)
-
     override suspend fun getLatestUpdates(page: Int): MangasPage = fetchMangaList(mangaListUrl(page), page)
 
     private fun mangaListUrl(page: Int, sort: String = "latest_chapter"): HttpUrl {
@@ -62,20 +58,30 @@ abstract class Doujindesu : KeiSource() {
             .build()
     }
 
-    private suspend fun fetchMangaList(url: HttpUrl, page: Int): MangasPage {
+    private suspend fun fetchMangaList(url: HttpUrl, page: Int, exactQuery: String? = null): MangasPage {
         val response = client.get(url)
         val total = response.headers["x-total-count"]?.toIntOrNull()
         val hasNextPage = total?.let { page * LIMIT < it } ?: true
         val mangas = response.parseAs<List<MangaItem>>()
-        return MangasPage(mangas.map { it.toSManga(baseUrl) }, hasNextPage)
+
+        // The listing API search can miss an existing manga even when its canonical
+        // /manga/{slug} entry exists. Supplement page 1 with a direct exact-title lookup.
+        val exactMatch = if (page == 1 && !exactQuery.isNullOrBlank()) {
+            val slug = exactQuery.toSearchSlug()
+            if (slug.isNotBlank()) {
+                runCatching { client.get("$apiUrl/manga/$slug".toHttpUrl()).parseAs<MangaItem>() }.getOrNull()
+            } else null
+        } else null
+
+        val result = if (exactMatch != null && mangas.none { it.slug == exactMatch.slug }) {
+            listOf(exactMatch) + mangas
+        } else mangas
+        return MangasPage(result.map { it.toSManga(baseUrl) }, hasNextPage)
     }
 
     private suspend fun fetchTaxonomyList(url: HttpUrl): MangasPage {
         val dto = client.get(url).parseAs<TaxonomyMangas>()
-        return MangasPage(
-            dto.mangaList.map { it.toSManga(baseUrl) },
-            dto.pagination.page < dto.pagination.totalPages,
-        )
+        return MangasPage(dto.mangaList.map { it.toSManga(baseUrl) }, dto.pagination.page < dto.pagination.totalPages)
     }
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
@@ -88,9 +94,7 @@ abstract class Doujindesu : KeiSource() {
             val selected = agsFilter.values[agsFilter.state]
             val type = selected.key
             val cacheKey = "$type:$agsValue"
-
             if (type.isNotBlank() && !agsValue.isNullOrBlank()) {
-                // Search the input and pick a slug if not cached
                 val slug = slugCache[cacheKey] ?: run {
                     val url = "$apiUrl/taxonomy/$type/".toHttpUrl().newBuilder()
                         .addQueryParameter("search", agsValue)
@@ -99,7 +103,6 @@ abstract class Doujindesu : KeiSource() {
                     client.get(url).parseAs<TermsResult>().terms.firstOrNull()?.slug
                         ?: throw IOException("Gagal menemukan: $agsValue")
                 }.also { slugCache[cacheKey] = it }
-
                 val taxonomyUrl = "$apiUrl/taxonomy/$type/$slug".toHttpUrl().newBuilder()
                     .addQueryParameter("limit", LIMIT.toString())
                     .addQueryParameter("page", page.toString())
@@ -110,34 +113,31 @@ abstract class Doujindesu : KeiSource() {
             }
         }
 
-        // Usual query search + other filters
         val builder = mangaListUrl(page).newBuilder()
-
+        var hasRestrictiveFilter = false
         if (hasQuery) builder.addQueryParameter("search", query)
 
         filters.forEach { filter ->
             when (filter) {
-                is StatusList -> {
-                    if (filter.state in filter.values.indices) {
-                        filter.values[filter.state].key.takeIf { it.isNotBlank() }
-                            ?.let { builder.addQueryParameter("status", it) }
+                is StatusList -> if (filter.state in filter.values.indices) {
+                    filter.values[filter.state].key.takeIf { it.isNotBlank() }?.let {
+                        hasRestrictiveFilter = true
+                        builder.addQueryParameter("status", it)
                     }
                 }
-                is CategoryNames -> {
-                    if (filter.state in filter.values.indices) {
-                        filter.values[filter.state].key.takeIf { it.isNotBlank() }
-                            ?.let { builder.addQueryParameter("type", it) }
+                is CategoryNames -> if (filter.state in filter.values.indices) {
+                    filter.values[filter.state].key.takeIf { it.isNotBlank() }?.let {
+                        hasRestrictiveFilter = true
+                        builder.addQueryParameter("type", it)
                     }
                 }
-                is OrderBy -> {
-                    if (filter.state in filter.values.indices) {
-                        filter.values[filter.state].key.takeIf { it.isNotBlank() }
-                            ?.let { builder.addQueryParameter("sort", it) }
-                    }
+                is OrderBy -> if (filter.state in filter.values.indices) {
+                    filter.values[filter.state].key.takeIf { it.isNotBlank() }?.let { builder.addQueryParameter("sort", it) }
                 }
                 is GenreList -> {
                     val selected = filter.state.filter { it.state }
                     if (selected.isNotEmpty()) {
+                        hasRestrictiveFilter = true
                         builder.addEncodedQueryParameter("genre", selected.joinToString(",") { it.id.lowercase().replace(" ", "-") })
                     }
                 }
@@ -145,7 +145,8 @@ abstract class Doujindesu : KeiSource() {
             }
         }
 
-        return fetchMangaList(builder.build(), page)
+        val exactQuery = query.takeIf { hasQuery && !hasRestrictiveFilter }
+        return fetchMangaList(builder.build(), page, exactQuery)
     }
 
     override fun getMangaUrl(manga: SManga) = "$baseUrl/manga/${manga.getSlug()}"
@@ -161,28 +162,16 @@ abstract class Doujindesu : KeiSource() {
             else -> return null
         } ?: return null
         return client.get("$apiUrl/manga/$slug".toHttpUrl()).parseAs<MangaItem>().toSManga(baseUrl).apply {
-            setUrlWithoutDomain(getMangaUrl(this))
-            initialized = true
+            setUrlWithoutDomain(getMangaUrl(this)); initialized = true
         }
     }
 
-    override suspend fun fetchMangaUpdate(
-        manga: SManga,
-        chapters: List<SChapter>,
-        fetchDetails: Boolean,
-        fetchChapters: Boolean,
-    ): SMangaUpdate {
+    override suspend fun fetchMangaUpdate(manga: SManga, chapters: List<SChapter>, fetchDetails: Boolean, fetchChapters: Boolean): SMangaUpdate {
         val item = client.get("$apiUrl/manga/${manga.getSlug()}".toHttpUrl()).parseAs<MangaItem>()
-        return SMangaUpdate(
-            item.toSManga(baseUrl),
-            item.chapters.mapIndexed { index, chapter ->
-                chapter.toSChapter(isLast = item.isCompleted() && index == 0)
-            },
-        )
+        return SMangaUpdate(item.toSManga(baseUrl), item.chapters.mapIndexed { index, chapter -> chapter.toSChapter(isLast = item.isCompleted() && index == 0) })
     }
 
     override fun getChapterUrl(chapter: SChapter): String = "$baseUrl/reader/${chapter.url}"
-
     override suspend fun getPageList(chapter: SChapter): List<Page> = client.get("$apiUrl/chapters/${chapter.url}".toHttpUrl()).parseAs<PageList>().pages.mapIndexed { i, imgUrl ->
         Page(i, imageUrl = Parser.unescapeEntities(imgUrl, false))
     }
@@ -202,6 +191,10 @@ abstract class Doujindesu : KeiSource() {
         val fullUrl = if (url.startsWith("http")) url else "$baseUrl/${url.removePrefix("/")}"
         return fullUrl.toHttpUrl().pathSegments.last { it.isNotBlank() }
     }
+
+    private fun String.toSearchSlug(): String = trim().lowercase()
+        .replace(Regex("[^\\p{L}\\p{N}]+"), "-")
+        .trim('-')
 
     companion object {
         private const val APP_SECRET = "dfdf72051dbfdc7d76889ebd31324e74"
