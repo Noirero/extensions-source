@@ -49,12 +49,12 @@ jobs:
           text = source.read_text()
           old = "        val builder = mangaListUrl(page).newBuilder()\n        var hasRestrictiveFilter = false"
           new = """        // Search must mirror the site's current /api/manga request. Do not
-          // inherit the browse-only latest_chapter sort: that changes search results.
-          val offset = (page - 1) * LIMIT
-          val builder = \"$apiUrl/manga\".toHttpUrl().newBuilder()
-              .addQueryParameter(\"limit\", LIMIT.toString())
-              .addQueryParameter(\"offset\", offset.toString())
-          var hasRestrictiveFilter = false"""
+                  // inherit the browse-only latest_chapter sort: that changes search results.
+                  val offset = (page - 1) * LIMIT
+                  val builder = \"$apiUrl/manga\".toHttpUrl().newBuilder()
+                      .addQueryParameter(\"limit\", LIMIT.toString())
+                      .addQueryParameter(\"offset\", offset.toString())
+                  var hasRestrictiveFilter = false"""
           if old not in text:
               raise SystemExit("Expected search builder block not found")
           source.write_text(text.replace(old, new, 1))
