@@ -1,0 +1,132 @@
+name: Fork PR Extension Check
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'lib/**'
+      - 'core/**'
+      - 'build-logic/**'
+      - '.github/scripts/**'
+      - '.github/workflows/fork_pr_extension_check.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-pr-extension-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CI_CHUNK_SIZE: 80
+  IS_PR_CHECK: true
+
+jobs:
+  prepare:
+    name: Detect changed extensions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      lint_modules: ${{ steps.matrix.outputs.lint_modules }}
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Audit package names
+        run: python ./.github/scripts/audit-packages.py
+
+      - id: matrix
+        name: Generate changed-extension matrix
+        run: python ./.github/scripts/generate-build-matrices.py origin/main
+
+  build:
+    name: Validate extensions (${{ matrix.chunk.number }})
+    needs: prepare
+    if: ${{ toJson(fromJson(needs.prepare.outputs.matrix).chunk) != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          cache-read-only: true
+
+      - name: Assemble and lint changed extensions
+        env:
+          MODULES: ${{ join(matrix.chunk.modules, ' ') }}
+        run: |
+          set -euo pipefail
+          TASKS=()
+          for module in $MODULES; do
+            TASKS+=("${module}:assembleRelease" "${module}:lintRelease")
+          done
+          ./gradlew "${TASKS[@]}"
+
+      - name: Verify build outputs exist
+        env:
+          MODULES: ${{ join(matrix.chunk.modules, ' ') }}
+        run: |
+          set -euo pipefail
+          for module in $MODULES; do
+            module_path="${module#:}"
+            module_path="${module_path//:/\/}"
+            if ! compgen -G "$module_path/build/outputs/apk/release/*.apk" > /dev/null && \
+               ! compgen -G "$module_path/build/outputs/jar/release/*.jar" > /dev/null; then
+              echo "No APK/JAR output found for $module"
+              exit 1
+            fi
+          done
+
+  lint-shared:
+    name: Lint changed shared modules
+    needs: prepare
+    if: ${{ needs.prepare.outputs.lint_modules != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          cache-read-only: true
+
+      - name: Lint shared modules
+        env:
+          MODULES: ${{ join(fromJSON(needs.prepare.outputs.lint_modules), ' ') }}
+        run: |
+          set -euo pipefail
+          TASKS=()
+          for module in $MODULES; do
+            TASKS+=("${module}:lintRelease")
+          done
+          ./gradlew "${TASKS[@]}"
