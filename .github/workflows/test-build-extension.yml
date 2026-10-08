@@ -39,6 +39,32 @@ jobs:
             exit 1
           fi
 
+      - name: Apply Doujindesu v3 search candidate
+        if: inputs.module == 'src/id/doujindesu'
+        shell: python
+        run: |
+          from pathlib import Path
+
+          source = Path("src/id/doujindesu/src/eu/kanade/tachiyomi/extension/id/doujindesu/Doujindesu.kt")
+          text = source.read_text()
+          old = "        val builder = mangaListUrl(page).newBuilder()\n        var hasRestrictiveFilter = false"
+          new = """        // Search must mirror the site's current /api/manga request. Do not
+          // inherit the browse-only latest_chapter sort: that changes search results.
+          val offset = (page - 1) * LIMIT
+          val builder = \"$apiUrl/manga\".toHttpUrl().newBuilder()
+              .addQueryParameter(\"limit\", LIMIT.toString())
+              .addQueryParameter(\"offset\", offset.toString())
+          var hasRestrictiveFilter = false"""
+          if old not in text:
+              raise SystemExit("Expected search builder block not found")
+          source.write_text(text.replace(old, new, 1))
+
+          gradle = Path("src/id/doujindesu/build.gradle.kts")
+          build = gradle.read_text()
+          if "versionCode = 2" not in build:
+              raise SystemExit("Expected Doujindesu versionCode 2 not found")
+          gradle.write_text(build.replace("versionCode = 2", "versionCode = 3", 1))
+
       - name: Set up Java
         uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
